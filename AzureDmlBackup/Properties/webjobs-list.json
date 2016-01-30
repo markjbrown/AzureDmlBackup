@@ -1,0 +1,17 @@
+﻿{
+  "$schema": "http://schemastore.org/schemas/json/webjobs-list.json",
+  "WebJobs": [
+    {
+      "filePath": "../BackupExec/BackupExec.csproj"
+    },
+    {
+      "filePath": "../Full/Full.csproj"
+    },
+    {
+      "filePath": "../Incremental/Incremental.csproj"
+    },
+    {
+      "filePath": "../DmlExec/DmlExec.csproj"
+    }
+  ]
+}
