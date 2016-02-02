@@ -83,8 +83,8 @@ namespace DmlExec
 
             try
             {
-                CloudBlobContainer sourceContainer = await GetContainerAsync(copyItem.SourceAccount, copyItem.SourceContainer);
-                CloudBlobContainer destinationContainer = await GetContainerAsync(copyItem.DestinationAccount, copyItem.DestinationContainer);
+                CloudBlobContainer sourceContainer = await GetContainerAsync(copyItem.SourceAccountToken, copyItem.SourceContainer);
+                CloudBlobContainer destinationContainer = await GetContainerAsync(copyItem.DestinationAccountToken, copyItem.DestinationContainer);
 
                 BlobContinuationToken continueToken = null;
 
@@ -196,37 +196,29 @@ namespace DmlExec
                     throw new Exception("Unknown CloudBlob type");
             }
 
-            // Use this is running older C#
-            //if (blob is CloudBlockBlob)
-            //    cloudBlob = container.GetBlockBlobReference(blob.Name);
-            //else if (blob is CloudPageBlob)
-            //    cloudBlob = container.GetPageBlobReference(blob.Name);
-            //else if (blob is CloudAppendBlob)
-            //    cloudBlob = container.GetAppendBlobReference(blob.Name);
-
             return cloudBlob;
         }
-        private async static Task<CloudBlobContainer> GetContainerAsync(string accountKey, string containerName)
+        private async static Task<CloudBlobContainer> GetContainerAsync(string accountToken, string containerName)
         {
-            CloudBlobClient client = GetAccount(accountKey).CreateCloudBlobClient();
+            CloudBlobClient client = GetAccount(accountToken).CreateCloudBlobClient();
             client.DefaultRequestOptions = blobRequestOptions;
             CloudBlobContainer container = client.GetContainerReference(containerName);
             await container.CreateIfNotExistsAsync();
             return container;
         }
-        private static CloudStorageAccount GetAccount(string accountKey)
+        private static CloudStorageAccount GetAccount(string accountToken)
         {
             CloudStorageAccount account;
 
-            if (!CloudStorageAccount.TryParse(GetConnectionString(accountKey), out account))
+            if (!CloudStorageAccount.TryParse(GetConnectionString(accountToken), out account))
                 throw new StorageException("Error Parsing Storage Account Connection String");
             else
                 return account;
         }
-        private static string GetConnectionString(string accountKey)
+        private static string GetConnectionString(string accountToken)
         {
             // Connection strings can be in app/web.config or in portal "connection strings" for host web app.
-            return ConfigurationManager.ConnectionStrings[accountKey].ConnectionString;
+            return ConfigurationManager.ConnectionStrings[accountToken].ConnectionString;
         }
         static void StorageRequest_Retrying(object sender, RequestEventArgs e)
         {
