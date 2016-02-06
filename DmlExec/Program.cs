@@ -7,7 +7,6 @@ using Microsoft.Azure.WebJobs;
 
 namespace DmlExec
 {
-    // To learn more about Microsoft Azure WebJobs SDK, please see http://go.microsoft.com/fwlink/?LinkID=320976
     class Program
     {
         // Set the following connection strings in the Azure Portal for this WebJob to run:
