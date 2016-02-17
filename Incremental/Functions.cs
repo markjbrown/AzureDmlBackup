@@ -21,7 +21,6 @@ namespace Incremental
                 string sourceAccountToken = "MySourceAccount";
                 string destinationAccountToken = "MyDestinationAccount";
 
-
                 // Backup type of "full" or "incremental"
                 // Blob is always copied if it does not exist in destination container
                 // When Incremental = false, overwrite blob even if it exists in destination container
@@ -29,10 +28,8 @@ namespace Incremental
                 bool isIncremental = true;
 
                 // Pop messages on the queue to copy one or more containers between two storage accounts
-                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "stuff50k", "stuff50kbackup", isIncremental, log));
-                //message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "stuffsmall", "stuffsmallbackup", isIncremental, log));
-                //message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
-                //message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
+                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
+                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
             }
             catch (Exception ex)
             {
