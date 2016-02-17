@@ -284,6 +284,9 @@ namespace DmlExec
                     cancellationToken: cancellationTokenSource.Token);
 
                 // Store the transfer checkpoint.
+                // [longwen] How does the resume feature work here? Looks the checkpoint is assigned to a local variable and lost afterwards. 
+                // FYI, the checkpoint is an serializable object. Thus, DMLib can resume a transfer cross process by presisting the
+                // checkpoint into a local file and then load it back.
                 transferCheckpoint = transferContext.LastCheckpoint;
             }
             catch (TransferException te)
@@ -303,6 +306,7 @@ namespace DmlExec
         {
             CloudBlob cloudBlob = null;
 
+            // [longwen] You can use cloudBlob.BlobType to check the blob type here
             switch (blob.GetType().Name)
             {
                 case nameof(CloudBlockBlob):
@@ -358,6 +362,22 @@ namespace DmlExec
         }
         public static Task ForEachAsync<T>(this IEnumerable<T> source, int parallelTasks, Func<T, Task> body)
         {
+            // [longwen] This function will separate the listed blobs into #dop groups and then launch #dop async tasks to copy these blobs.
+            // Blobs within the same groups will be copied sequentially. The outter listing loop will continue to get more blobs from the source
+            // container once all these #dop groups of blobs are copied. Please tell me if I didn't understand this function correctly.
+            // 
+            // This function can be not very efficient in some cases:
+            //   1. If one of the group contains some large blobs, it can be the bottleneck while all other groups finish and the listing loop is 
+            //      waiting for it.
+            //   2. ListBlobsSegmentedAsync gets at most 5000 blobs. This call can be time consuming regarding the response size while no blob is 
+            //      copied at the same time.
+            //
+            // In azcopy, we use a producer-consumer pattern to list and transfer blobs. Basically, there are two threads: One lists blobs from the source
+            // container and add them into a blocking queue. This thread will be blocked if the queue reaches its size limitation. Another thread get blobs
+            // out of the queue and start a worker thread to copy the blob. This thread maintains a counter of the outstanding workers and block itself for
+            // a while if it reaches the parallel limitation.
+            //
+            // For the listing thread, it calls ListBlobSegmentedAsync with a smaller segment size. In AzCopy, the magic number is 250.
             return Task.WhenAll(
                 from partition in Partitioner.Create(source).GetPartitions(parallelTasks)
                 select Task.Run(async delegate
