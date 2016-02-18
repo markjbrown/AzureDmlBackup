@@ -15,6 +15,8 @@ using System.Collections.Concurrent;
 using System.Linq;
 using System.Globalization;
 using Shared;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Formatters.Binary;
 
 namespace DmlExec
 {
@@ -28,198 +30,97 @@ namespace DmlExec
 
         private static TextWriter _log;
 
-        // This function will get triggered/executed when a new message is written on the Azure WebJobs Queue called backupqueue
-        // This version uses CopyDirectoryAsync in DML 0.1. Blobs are copied in parallel using ForEachAsync()
         public async static Task ProcessQueueMessage([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
         {
-        _log = log;
-        await log.WriteLineAsync("Job Start: " + copyItem.JobName);
+            _log = log;
+            log.WriteLine("Job Start: " + copyItem.JobName);
 
-        // This class accumulates transfer data during the process
-        ProgressRecorder progressRecorder = new ProgressRecorder();
+            // This class accumulates transfer data during the process
+            ProgressRecorder progressRecorder = new ProgressRecorder();
 
-        try
-        {
-            // OpContext for pre-copy retries on Azure Storage
-            // DML has its own context object and retry
-            OperationContext opContext = new OperationContext();
-            opContext.Retrying += StorageRequest_Retrying;
-
-            // Define Blob Request Options
-            BlobRequestOptions blobRequestOptions = new BlobRequestOptions
+            try
             {
-                // Defined Exponential Retry Policy
-                RetryPolicy = _retryPolicy
-            };
+                // OpContext to track PreCopy Retries on Azure Storage
+                // DML has its own context object and retry
+                OperationContext opContext = new OperationContext();
+                opContext.Retrying += StorageRequest_Retrying;
 
-            // Set the number of parallel tasks in DML. 
-            // This allows it to copy multiple items at once when copying a container or directory
-            // Default value is Environment.ProcessorCount * 8
-            int parallelTasks = Environment.ProcessorCount * 8;
-            //TransferManager.Configurations.ParallelOperations = parallelTasks;
-
-            // Set the number of connections. 
-            // This should match ParallelOperations so each DML copy task has its own connection to Azure Storage
-            ServicePointManager.DefaultConnectionLimit = parallelTasks;
-
-            // Short circuit additional request round trips. We are not chunking and
-            // uploading large amounts of data where we'd send 100's so set to false
-            ServicePointManager.Expect100Continue = false;
-
-            // CancellationTokenSource used to cancel the transfer
-            CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
-
-            // Represents a checkpoint from which a transfer may be resumed and continue
-            // The checkpoint gets set on each call to CopyBlobAsync(). This allows the WebJob
-            // to fail then pick it right up and continue to copy blobs, completing the copy job
-            TransferCheckpoint transferCheckpoint = null;
-
-            // Open connections to both storage accounts
-            CloudStorageAccount sourceAccount = GetAccount(copyItem.SourceAccountToken);
-            CloudStorageAccount destinationAccount = GetAccount(copyItem.DestinationAccountToken);
-
-            // Context object for the transfer, provides additional runtime information about its execution
-            TransferContext transferContext = new TransferContext
-            {
-                // Pipe transfer progress data to ProgressRecorder
-                ProgressHandler = progressRecorder,
-
-                // Callback to overwrite destination if it exists
-                OverwriteCallback = (source, destination) =>
+                // Define Blob Request Options
+                BlobRequestOptions blobRequestOptions = new BlobRequestOptions
                 {
-                    return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem, blobRequestOptions, opContext);
-                }
-            };
+                    // Defined Exponential Retry Policy above
+                    RetryPolicy = _retryPolicy
+                };
 
-            // Get the root source and destination directories for the two containers to be copied
-            CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer, blobRequestOptions);
-            CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer, blobRequestOptions);
+                // Set the number of parallel tasks in DML. 
+                // This allows it to copy multiple items at once when copying a container or directory
+                // The best (and default value) is Environment.ProcessorCount * 8
+                int parallelTasks = Environment.ProcessorCount * 8;
+                TransferManager.Configurations.ParallelOperations = parallelTasks;
 
-            // Continuation token for the Do..While loop on ListBlobsSegmentedAsync
-            BlobContinuationToken continueToken = null;
+                // Set the number of connections. 
+                // This should match ParallelOperations so each DML copy task has its own connection to Azure Storage
+                ServicePointManager.DefaultConnectionLimit = parallelTasks;
 
-            do
-            {
-                // Fetch blobs in groups of 5000 max. If more than that loop until continue token is not null
-                var listTask = await sourceDirectory.ListBlobsSegmentedAsync(true, BlobListingDetails.None, null, continueToken, blobRequestOptions, opContext, cancelToken);
+                // Short circuit additional request round trips. We are not chunking and
+                // uploading large amounts of data where we'd send 100's so set to false
+                ServicePointManager.Expect100Continue = false;
 
-                // Save the continuation token
-                continueToken = listTask.ContinuationToken;
+                // CancellationTokenSource used to cancel the transfer
+                CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
 
-                // Asynchronous parallel iteratation through blobs to copy
-                await listTask.Results.ForEachAsync(parallelTasks, async task =>
+                // Open connections to both storage accounts
+                CloudStorageAccount sourceAccount = GetAccount(copyItem.SourceAccountToken);
+                CloudStorageAccount destinationAccount = GetAccount(copyItem.DestinationAccountToken);
+
+                // Represents a checkpoint from which a transfer may be resumed and continued.
+                // This is initalized as null first time then hydrated within CopyDirectoryAsync().
+                // However if this job is being resumed from a previous failure this function will hydrate
+                // Checkpoint from a serialized checkpoint saved to local storage.
+                TransferCheckpoint transferCheckpoint = GetTranferCheckpoint(copyItem.JobId);
+
+                // Context object for the transfer, provides additional runtime information about its execution
+                TransferContext transferContext = new TransferContext(transferCheckpoint)
                 {
-                    CloudBlob sourceBlob = (CloudBlob)task;
-                    CloudBlob destinationBlob = GetBlobReference(destinationDirectory, sourceBlob);
+                    // Pipe transfer progress data to ProgressRecorder
+                    // ProgressRecorder is used to log the results of the copy operation
+                    ProgressHandler = progressRecorder,
 
-                        // Copy the blob
-                        await CopyBlobAsync(sourceBlob, destinationBlob, transferContext, transferCheckpoint, cancellationTokenSource);
-
-                        // Check for cancellation of the WebJob
-                        if (cancelToken.IsCancellationRequested)
+                    // If a file in the destination already exists this Callback is called. 
+                    // This can be used to tell DML whether to overwrite the destination or not
+                    // In OverwriteFile() here we check to see if want/need to overwrite the destination
+                    OverwriteCallback = (source, destination) =>
                     {
-                        await log.WriteLineAsync("Web Job Cancellation Requested");
-                        cancellationTokenSource.Cancel();
+                        return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem, blobRequestOptions, opContext);
                     }
-                });
+                };
+
+                // Set Options for copying the container
+                CopyDirectoryOptions copyDirectoryOptions = new CopyDirectoryOptions
+                {
+                    SearchPattern = "",
+                    IncludeSnapshots = true,
+                    Recursive = true
+                };
+
+                // Get the root source and destination directories for the two containers to be copied
+                CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer, blobRequestOptions);
+                CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer, blobRequestOptions);
+
+
+                // Copy the container
+                await CopyDirectoryAsync(copyItem.JobId, sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
+
+
+                log.WriteLine(progressRecorder.ToString());
+                log.WriteLine("Job Complete: " + copyItem.JobName);
             }
-            while (continueToken != null);
-
-            await log.WriteLineAsync(progressRecorder.ToString());
-            await log.WriteLineAsync("Job Complete: " + copyItem.JobName);
+            catch (Exception ex)
+            {
+                log.WriteLine("Backup Job error: " + copyItem.JobName + ", Error: " + ex.Message);
+                log.WriteLine(progressRecorder.ToString());
+            }
         }
-        catch (Exception ex)
-        {
-            await log.WriteLineAsync("Backup Job error: " + copyItem.JobName + ", Error: " + ex.Message);
-            await log.WriteLineAsync(progressRecorder.ToString());
-        }
-    }
-
-    //    public async static Task ProcessQueueMessage2([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
-    //{
-    //    _log = log;
-    //    log.WriteLine("Job Start: " + copyItem.JobName);
-
-    //    // This class accumulates transfer data during the process
-    //    ProgressRecorder progressRecorder = new ProgressRecorder();
-
-    //    try
-    //    {
-    //        // OpContext to track PreCopy Retries on Azure Storage
-    //        // DML has its own context object and retry
-    //        OperationContext opContext = new OperationContext();
-    //        opContext.Retrying += StorageRequest_Retrying;
-
-    //        // Define Blob Request Options
-    //        BlobRequestOptions blobRequestOptions = new BlobRequestOptions
-    //        {
-    //            // Defined Exponential Retry Policy above
-    //            RetryPolicy = _retryPolicy
-    //        };
-
-    //        // Set the number of parallel tasks in DML. 
-    //        // This allows it to copy multiple items at once when copying a container or directory
-    //        // Default value is Environment.ProcessorCount * 8
-    //        int parallelTasksPerProc = Convert.ToInt32(ConfigurationManager.AppSettings["TasksPerProc"]);
-    //        int parallelTasks = Environment.ProcessorCount * parallelTasksPerProc;
-    //        TransferManager.Configurations.ParallelOperations = parallelTasks;
-
-    //        // Set the number of connections. 
-    //        // This should match ParallelOperations so each DML copy task has its own connection to Azure Storage
-    //        ServicePointManager.DefaultConnectionLimit = parallelTasks;
-    //        log.WriteLine("Parallel Operations = " + parallelTasks.ToString());
-
-    //        // Short circuit additional request round trips. We are not chunking and
-    //        // uploading large amounts of data where we'd send 100's so set to false
-    //        ServicePointManager.Expect100Continue = false;
-
-    //        // CancellationTokenSource used to cancel the transfer
-    //        CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
-
-    //        // Represents a checkpoint from which a transfer may be resumed and continued
-    //        // This is set within the CopyContainerAsync function
-    //        TransferCheckpoint transferCheckpoint = null;
-
-    //        // Open connections to both storage accounts
-    //        CloudStorageAccount sourceAccount = GetAccount(copyItem.SourceAccountToken);
-    //        CloudStorageAccount destinationAccount = GetAccount(copyItem.DestinationAccountToken);
-
-    //        // Context object for the transfer, provides additional runtime information about its execution
-    //        TransferContext transferContext = new TransferContext
-    //        {
-    //            // Pipe transfer progress data to ProgressRecorder
-    //            ProgressHandler = progressRecorder,
-
-    //            // Callback to overwrite destination if it exists
-    //            OverwriteCallback = (source, destination) =>
-    //            {
-    //                return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem, blobRequestOptions, opContext);
-    //            }
-    //        };
-
-    //        CopyDirectoryOptions copyDirectoryOptions = new CopyDirectoryOptions
-    //        {
-    //            IncludeSnapshots = true,
-    //            Recursive = true
-    //        };
-
-    //        // Get the root source and destination directories for the two containers to be copied
-    //        CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer, blobRequestOptions);
-    //        CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer, blobRequestOptions);
-
-    //        // Copy the container
-    //        await CopyDirectoryAsync(sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
-
-
-    //        log.WriteLine(progressRecorder.ToString());
-    //        log.WriteLine("Job Complete: " + copyItem.JobName);
-    //    }
-    //    catch (Exception ex)
-    //    {
-    //        log.WriteLine("Backup Job error: " + copyItem.JobName + ", Error: " + ex.Message);
-    //        log.WriteLine(progressRecorder.ToString());
-    //    }
-    //}
         private static bool OverwriteFile(string sourceUri, string destinationUri, CloudStorageAccount sourceAccount, CloudStorageAccount destinationAccount, CopyItem copyItem, BlobRequestOptions blobRequestOptions, OperationContext opContext)
         {
             // If Incremental backup only copy if source is newer
@@ -241,7 +142,7 @@ namespace DmlExec
             }
 
         }
-        private async static Task CopyDirectoryAsync(CloudBlobDirectory sourceDirectory, CloudBlobDirectory destinationDirectory, CopyDirectoryOptions copyDirectoryOptions, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
+        private async static Task CopyDirectoryAsync(string jobId, CloudBlobDirectory sourceDirectory, CloudBlobDirectory destinationDirectory, CopyDirectoryOptions copyDirectoryOptions, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
         {
             // Start the transfer
             try
@@ -254,7 +155,7 @@ namespace DmlExec
                     context: transferContext,
                     cancellationToken: cancellationTokenSource.Token);
 
-                // Store the transfer checkpoint.
+                // Store the transfer checkpoint to record the completed copy operation
                 transferCheckpoint = transferContext.LastCheckpoint;
             }
             catch (TransferException te)
@@ -268,37 +169,11 @@ namespace DmlExec
                     sb.AppendLine("Transfer Error Code: " + te.ErrorCode);
                     await _log.WriteLineAsync(sb.ToString());
                 }
-            }
-        }
-        private async static Task CopyBlobAsync(CloudBlob sourceBlob, CloudBlob destinationBlob, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
-        {
-            // Start the transfer
-            try
-            {
-                await TransferManager.CopyAsync(
-                    sourceBlob: sourceBlob,
-                    destBlob: destinationBlob,
-                    isServiceCopy: false, //Async Server-Side Copy
-                    options: null,
-                    context: transferContext,
-                    cancellationToken: cancellationTokenSource.Token);
-
-                // Store the transfer checkpoint.
-                // [longwen] How does the resume feature work here? Looks the checkpoint is assigned to a local variable and lost afterwards. 
-                // FYI, the checkpoint is an serializable object. Thus, DMLib can resume a transfer cross process by presisting the
-                // checkpoint into a local file and then load it back.
-                transferCheckpoint = transferContext.LastCheckpoint;
-            }
-            catch (TransferException te)
-            {
-                // Swallow Exceptions from skipped files in Overwrite Callback
-                // Log any other Transfer Exceptions
-                if (te.ErrorCode != TransferErrorCode.SubTransferFails)
+                else
                 {
-                    StringBuilder sb = new StringBuilder();
-                    sb.AppendLine("Transfer Error: " + te.Message);
-                    sb.AppendLine("Transfer Error Code: " + te.ErrorCode);
-                    await _log.WriteLineAsync(sb.ToString());
+                    // Save the checkpoint so the WebJob can be restarted and resume the copy
+                    transferCheckpoint = transferContext.LastCheckpoint;
+                    SaveTransferContext(jobId, transferCheckpoint);
                 }
             }
         }
@@ -306,21 +181,14 @@ namespace DmlExec
         {
             CloudBlob cloudBlob = null;
 
-            // [longwen] You can use cloudBlob.BlobType to check the blob type here
-            switch (blob.GetType().Name)
-            {
-                case nameof(CloudBlockBlob):
-                    cloudBlob = directory.GetBlockBlobReference(blob.Name);
-                    break;
-                case nameof(CloudPageBlob):
-                    cloudBlob = directory.GetPageBlobReference(blob.Name);
-                    break;
-                case nameof(CloudAppendBlob):
-                    cloudBlob = directory.GetAppendBlobReference(blob.Name);
-                    break;
-                default:
-                    throw new Exception("Unknown CloudBlob type");
-            }
+            if (blob.BlobType == BlobType.BlockBlob)
+                cloudBlob = directory.GetBlockBlobReference(blob.Name);
+            else if (blob.BlobType == BlobType.PageBlob)
+                cloudBlob = directory.GetPageBlobReference(blob.Name);
+            else if (blob.BlobType == BlobType.AppendBlob)
+                cloudBlob = directory.GetAppendBlobReference(blob.Name);
+            else
+                throw new Exception("Unknown CloudBlob type");
 
             return cloudBlob;
         }
@@ -348,6 +216,55 @@ namespace DmlExec
             // Connection strings can be in app/web.config or in portal "connection strings" for host web app.
             return ConfigurationManager.ConnectionStrings[accountToken].ConnectionString;
         }
+        private static TransferCheckpoint GetTranferCheckpoint(string jobId)
+        {
+            TransferCheckpoint transferCheckpoint = null;
+
+            // Get the path to the checkpoint file
+            string path = GetLocalPath() + jobId.ToString();
+
+            // If the file does not exist, then first time job has run, return null
+            if (!File.Exists(path))
+                return null;
+
+            // File exists, resuming a copy operation
+            // Deserialize, hydrate Checkpoint and return
+            // CopyDirectoryAsync() will resume where it left off
+            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+            {
+                IFormatter formatter = new BinaryFormatter();
+
+                transferCheckpoint = formatter.Deserialize(stream) as TransferCheckpoint;
+            }
+
+            File.Delete(path);
+
+            return transferCheckpoint;
+        }
+        private static void SaveTransferContext(string jobId, TransferCheckpoint transferCheckpoint)
+        {
+            // Serialize the checkpoint into a file
+            string path = GetLocalPath() + jobId.ToString();
+            
+            using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                IFormatter formatter = new BinaryFormatter();
+                formatter.Serialize(stream, transferCheckpoint);
+            }
+        }
+        private static string GetLocalPath()
+        {
+            string localPath = "";
+
+            // Map the path, add trailing slash
+            localPath = Path.Combine(System.Web.HttpRuntime.AppDomainAppPath, "DmlTransfers\\");
+
+            // Create the directory if doesn't exist
+            if (!Directory.Exists(localPath))
+                Directory.CreateDirectory(localPath);
+
+            return localPath;
+        }
         static void StorageRequest_Retrying(object sender, RequestEventArgs e)
         {
             string errMessage = e.RequestInformation.Exception.Message;
@@ -359,33 +276,6 @@ namespace DmlExec
             string message = String.Format(CultureInfo.InvariantCulture, "Retry Count = {0}, Error = {1}, URI = {2}", retryCount, errMessage, path);
 
             _log.WriteLine("Azure Storage Request Retry", message);
-        }
-        public static Task ForEachAsync<T>(this IEnumerable<T> source, int parallelTasks, Func<T, Task> body)
-        {
-            // [longwen] This function will separate the listed blobs into #dop groups and then launch #dop async tasks to copy these blobs.
-            // Blobs within the same groups will be copied sequentially. The outter listing loop will continue to get more blobs from the source
-            // container once all these #dop groups of blobs are copied. Please tell me if I didn't understand this function correctly.
-            // 
-            // This function can be not very efficient in some cases:
-            //   1. If one of the group contains some large blobs, it can be the bottleneck while all other groups finish and the listing loop is 
-            //      waiting for it.
-            //   2. ListBlobsSegmentedAsync gets at most 5000 blobs. This call can be time consuming regarding the response size while no blob is 
-            //      copied at the same time.
-            //
-            // In azcopy, we use a producer-consumer pattern to list and transfer blobs. Basically, there are two threads: One lists blobs from the source
-            // container and add them into a blocking queue. This thread will be blocked if the queue reaches its size limitation. Another thread get blobs
-            // out of the queue and start a worker thread to copy the blob. This thread maintains a counter of the outstanding workers and block itself for
-            // a while if it reaches the parallel limitation.
-            //
-            // For the listing thread, it calls ListBlobSegmentedAsync with a smaller segment size. In AzCopy, the magic number is 250.
-            return Task.WhenAll(
-                from partition in Partitioner.Create(source).GetPartitions(parallelTasks)
-                select Task.Run(async delegate
-                {
-                    using (partition)
-                        while (partition.MoveNext())
-                            await body(partition.Current);
-                }));
         }
     }
 }

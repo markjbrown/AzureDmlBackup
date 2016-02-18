@@ -4,6 +4,7 @@ namespace Shared
 {
     public class CopyItem
     {
+        public string JobId { get; set; }
         public string JobName { get; set; }
         public string SourceAccountToken { get; set; }
         public string DestinationAccountToken { get; set; }
@@ -12,8 +13,9 @@ namespace Shared
         public bool IsIncremental { get; set; }
 
 
-        public CopyItem(string jobName, string sourceAccountToken, string destinationAccountToken, string sourceContainer, string destinationContainer, bool isIncremental)
+        public CopyItem(string jobId, string jobName, string sourceAccountToken, string destinationAccountToken, string sourceContainer, string destinationContainer, bool isIncremental)
         {
+            JobId = jobId;
             JobName = jobName;
             SourceAccountToken = sourceAccountToken;
             DestinationAccountToken = destinationAccountToken;

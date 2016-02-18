@@ -1,7 +1,7 @@
-﻿using System.IO;
+﻿using System;
+using System.IO;
 using Microsoft.Azure.WebJobs;
 using Shared;
-
 
 namespace Full
 {
@@ -34,13 +34,15 @@ namespace Full
 
         private static CopyItem CreateJob(string sourceAccountToken, string destinationAccountToken, string sourceContainer, string destinationContainer, bool isIncremental, TextWriter log)
         {
-            string job = "Full Backup, Account: " + sourceAccountToken + ", Source Container: " + sourceContainer + ", Destination Container: " + destinationContainer;
+            string jobName = "Full Backup, Account: " + sourceAccountToken + ", Source Container: " + sourceContainer + ", Destination Container: " + destinationContainer;
+
+            string jobId = new Guid().ToString();
 
             // Create CopyItem object, pass it to WebJobs queue
-            CopyItem copyitem = new CopyItem(job, sourceAccountToken, destinationAccountToken, sourceContainer, destinationContainer, isIncremental);
+            CopyItem copyitem = new CopyItem(jobId, jobName, sourceAccountToken, destinationAccountToken, sourceContainer, destinationContainer, isIncremental);
 
             // Log Job Creation
-            log.WriteLine("Create Job: " + job);
+            log.WriteLine("Create Job: " + jobName);
 
             return copyitem;
         }
