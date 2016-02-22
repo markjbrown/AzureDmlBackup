@@ -1,22 +1,19 @@
-﻿using System;
-using System.IO;
-using System.Threading.Tasks;
-using Microsoft.Azure.WebJobs;
-using Microsoft.WindowsAzure.Storage.DataMovement;
+﻿using Microsoft.Azure.WebJobs;
 using Microsoft.WindowsAzure.Storage;
 using Microsoft.WindowsAzure.Storage.Blob;
-using System.Threading;
-using System.Text;
-using System.Configuration;
-using System.Net;
+using Microsoft.WindowsAzure.Storage.DataMovement;
 using Microsoft.WindowsAzure.Storage.RetryPolicies;
-using System.Collections.Generic;
-using System.Collections.Concurrent;
-using System.Linq;
-using System.Globalization;
 using Shared;
+using System;
+using System.Configuration;
+using System.Globalization;
+using System.IO;
+using System.Net;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Formatters.Binary;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace DmlExec
 {
@@ -33,7 +30,7 @@ namespace DmlExec
         public async static Task ProcessQueueMessage([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
         {
             _log = log;
-            log.WriteLine("Job Start: " + copyItem.JobName);
+            await log.WriteLineAsync("Job Start: " + copyItem.JobName);
 
             // This class accumulates transfer data during the process
             ProgressRecorder progressRecorder = new ProgressRecorder();
@@ -73,32 +70,40 @@ namespace DmlExec
                 CloudStorageAccount sourceAccount = GetAccount(copyItem.SourceAccountToken);
                 CloudStorageAccount destinationAccount = GetAccount(copyItem.DestinationAccountToken);
 
+                
+
                 // Represents a checkpoint from which a transfer may be resumed and continued.
                 // This is initalized as null first time then hydrated within CopyDirectoryAsync().
                 // However if this job is being resumed from a previous failure this function will hydrate
                 // Checkpoint from a serialized checkpoint saved to local storage.
-                TransferCheckpoint transferCheckpoint = GetTranferCheckpoint(copyItem.JobId);
+                TransferCheckpoint transferCheckpoint = GetTransferCheckpoint(copyItem.JobId);
 
                 // Context object for the transfer, provides additional runtime information about its execution
-                TransferContext transferContext = new TransferContext(transferCheckpoint)
-                {
-                    // Pipe transfer progress data to ProgressRecorder
-                    // ProgressRecorder is used to log the results of the copy operation
-                    ProgressHandler = progressRecorder,
+                TransferContext transferContext;
 
-                    // If a file in the destination already exists this Callback is called. 
-                    // This can be used to tell DML whether to overwrite the destination or not
-                    // In OverwriteFile() here we check to see if want/need to overwrite the destination
-                    OverwriteCallback = (source, destination) =>
-                    {
-                        return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem, blobRequestOptions, opContext);
-                    }
+                if (transferCheckpoint != null)
+                    // New Copy Job
+                    transferContext = new TransferContext(transferCheckpoint);
+                else
+                    // Resumed Copy Job
+                    transferContext = new TransferContext();
+
+                // Pipe transfer progress data to ProgressRecorder
+                // ProgressRecorder is used to log the results of the copy operation
+                transferContext.ProgressHandler = progressRecorder;
+
+                // If the destination already exists this Callback is called. 
+                // Return true or false to tell DML whether to overwrite the destination or not
+                // OverwriteFile() determines whether to overwrite the destination file
+                transferContext.OverwriteCallback = (source, destination) =>
+                {
+                    return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem, blobRequestOptions, opContext);
                 };
 
-                // Set Options for copying the container
+
+                // Set Options for copying the container such as search patterns, recursive, etc.
                 CopyDirectoryOptions copyDirectoryOptions = new CopyDirectoryOptions
                 {
-                    SearchPattern = "",
                     IncludeSnapshots = true,
                     Recursive = true
                 };
@@ -112,13 +117,13 @@ namespace DmlExec
                 await CopyDirectoryAsync(copyItem.JobId, sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
 
 
-                log.WriteLine(progressRecorder.ToString());
-                log.WriteLine("Job Complete: " + copyItem.JobName);
+                await log.WriteLineAsync(progressRecorder.ToString());
+                await log.WriteLineAsync("Job Complete: " + copyItem.JobName);
             }
             catch (Exception ex)
             {
-                log.WriteLine("Backup Job error: " + copyItem.JobName + ", Error: " + ex.Message);
-                log.WriteLine(progressRecorder.ToString());
+                await log.WriteLineAsync("Backup Job error: " + copyItem.JobName + ", Error: " + ex.Message);
+                await log.WriteLineAsync(progressRecorder.ToString());
             }
         }
         private static bool OverwriteFile(string sourceUri, string destinationUri, CloudStorageAccount sourceAccount, CloudStorageAccount destinationAccount, CopyItem copyItem, BlobRequestOptions blobRequestOptions, OperationContext opContext)
@@ -147,13 +152,21 @@ namespace DmlExec
             // Start the transfer
             try
             {
-                await TransferManager.CopyDirectoryAsync(
+                Task task = TransferManager.CopyDirectoryAsync(
                     sourceBlobDir: sourceDirectory,
                     destBlobDir: destinationDirectory,
                     isServiceCopy: false,
                     options: copyDirectoryOptions,
                     context: transferContext,
                     cancellationToken: cancellationTokenSource.Token);
+
+                // Sleep for 1 seconds and cancel the transfer. 
+                // It may fail to cancel the transfer if transfer is done in 1 second. If so, no file will be copied after resume.
+                Thread.Sleep(1000);
+                Console.WriteLine("Cancel the transfer.");
+                cancellationTokenSource.Cancel();
+
+                await task;
 
                 // Store the transfer checkpoint to record the completed copy operation
                 transferCheckpoint = transferContext.LastCheckpoint;
@@ -162,35 +175,24 @@ namespace DmlExec
             {
                 // Swallow Exceptions from skipped files in Overwrite Callback
                 // Log any other Transfer Exceptions
-                if(te.ErrorCode != TransferErrorCode.SubTransferFails)
-                { 
+                if (te.ErrorCode != TransferErrorCode.SubTransferFails)
+                {
                     StringBuilder sb = new StringBuilder();
                     sb.AppendLine("Transfer Error: " + te.Message);
                     sb.AppendLine("Transfer Error Code: " + te.ErrorCode);
                     await _log.WriteLineAsync(sb.ToString());
                 }
-                else
-                {
-                    // Save the checkpoint so the WebJob can be restarted and resume the copy
-                    transferCheckpoint = transferContext.LastCheckpoint;
-                    SaveTransferContext(jobId, transferCheckpoint);
-                }
             }
-        }
-        private static CloudBlob GetBlobReference(CloudBlobDirectory directory, CloudBlob blob)
-        {
-            CloudBlob cloudBlob = null;
-
-            if (blob.BlobType == BlobType.BlockBlob)
-                cloudBlob = directory.GetBlockBlobReference(blob.Name);
-            else if (blob.BlobType == BlobType.PageBlob)
-                cloudBlob = directory.GetPageBlobReference(blob.Name);
-            else if (blob.BlobType == BlobType.AppendBlob)
-                cloudBlob = directory.GetAppendBlobReference(blob.Name);
-            else
-                throw new Exception("Unknown CloudBlob type");
-
-            return cloudBlob;
+            catch (Exception ex)
+            {
+                _log.WriteLine("Exception: " + ex.Message);
+                // Save the checkpoint so the WebJob can be restarted and resume the copy
+                transferCheckpoint = transferContext.LastCheckpoint;
+                SaveTransferCheckpoint(jobId, transferCheckpoint);
+                // Rethrow the exception
+                throw ex;
+            }
+            
         }
         private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName, BlobRequestOptions blobRequestOptions)
         {
@@ -216,40 +218,54 @@ namespace DmlExec
             // Connection strings can be in app/web.config or in portal "connection strings" for host web app.
             return ConfigurationManager.ConnectionStrings[accountToken].ConnectionString;
         }
-        private static TransferCheckpoint GetTranferCheckpoint(string jobId)
+        private static TransferCheckpoint GetTransferCheckpoint(string jobId)
         {
             TransferCheckpoint transferCheckpoint = null;
 
-            // Get the path to the checkpoint file
-            string path = GetLocalPath() + jobId.ToString();
+            try
+            { 
+                // Get the path to the checkpoint file
+                string path = GetLocalPath() + jobId.ToString();
 
-            // If the file does not exist, then first time job has run, return null
-            if (!File.Exists(path))
-                return null;
+                // If the file does not exist, then first time job has run, return a null checkpoint
+                if (File.Exists(path))
+                { 
+                    // File exists, so we are resuming a copy operation
+                    // Deserialize, hydrate Checkpoint and return
+                    // CopyDirectoryAsync() will resume where it left off
+                    using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+                    {
+                        IFormatter formatter = new BinaryFormatter();
 
-            // File exists, resuming a copy operation
-            // Deserialize, hydrate Checkpoint and return
-            // CopyDirectoryAsync() will resume where it left off
-            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
-            {
-                IFormatter formatter = new BinaryFormatter();
+                        transferCheckpoint = formatter.Deserialize(stream) as TransferCheckpoint;
+                    }
 
-                transferCheckpoint = formatter.Deserialize(stream) as TransferCheckpoint;
+                    File.Delete(path);
+                }
             }
-
-            File.Delete(path);
-
+            catch(Exception ex)
+            {
+                _log.WriteLine("Error Fetching Checkpoint for Resume:" + ex.Message);
+                return null;
+            }
             return transferCheckpoint;
         }
-        private static void SaveTransferContext(string jobId, TransferCheckpoint transferCheckpoint)
+        private static void SaveTransferCheckpoint(string jobId, TransferCheckpoint transferCheckpoint)
         {
-            // Serialize the checkpoint into a file
-            string path = GetLocalPath() + jobId.ToString();
+            try
+            { 
+                // Serialize the checkpoint into a file
+                string path = GetLocalPath() + jobId.ToString();
             
-            using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    IFormatter formatter = new BinaryFormatter();
+                    formatter.Serialize(stream, transferCheckpoint);
+                }
+            }
+            catch(Exception ex)
             {
-                IFormatter formatter = new BinaryFormatter();
-                formatter.Serialize(stream, transferCheckpoint);
+                _log.WriteLine("Error saving checkpoint:" + ex.Message);
             }
         }
         private static string GetLocalPath()

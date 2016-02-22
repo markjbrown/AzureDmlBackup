@@ -40,7 +40,7 @@ namespace Incremental
         {
             string jobName = "Incremental Backup, Account: " + sourceAccountToken + ", Source Container: " + sourceContainer + ", Destination Container: " + destinationContainer;
 
-            string jobId = new Guid().ToString();
+            string jobId = Guid.NewGuid().ToString();
 
             // Create CopyItem object, pass it to WebJobs queue
             CopyItem copyitem = new CopyItem(jobId, jobName, sourceAccountToken, destinationAccountToken, sourceContainer, destinationContainer, isIncremental);
