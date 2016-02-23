@@ -28,8 +28,9 @@ namespace Incremental
                 bool isIncremental = true;
 
                 // Pop messages on the queue to copy one or more containers between two storage accounts
-                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
-                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
+                //message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
+                //message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
+                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "stuff50k", "stuff50kbackup" + DateTimeOffset.Now.Ticks.ToString(), isIncremental, log));
             }
             catch (Exception ex)
             {
