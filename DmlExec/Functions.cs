@@ -25,6 +25,8 @@ namespace DmlExec
         private static IRetryPolicy _retryPolicy = new ExponentialRetry(_deltaBackOff, _maxRetries);
         // Retries (in MS) 100, 200, 400, 800, 1600 (+/- 20%)
 
+        private static BlobRequestOptions _blobRequestOptions;
+        private static OperationContext _opContext;
         private static TextWriter _log;
 
         public async static Task ProcessQueueMessage([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
@@ -39,11 +41,11 @@ namespace DmlExec
             {
                 // OpContext to track PreCopy Retries on Azure Storage
                 // DML has its own context object and retry
-                OperationContext opContext = new OperationContext();
-                opContext.Retrying += StorageRequest_Retrying;
+                _opContext = new OperationContext();
+                _opContext.Retrying += StorageRequest_Retrying;
 
                 // Define Blob Request Options
-                BlobRequestOptions blobRequestOptions = new BlobRequestOptions
+                _blobRequestOptions = new BlobRequestOptions
                 {
                     // Defined Exponential Retry Policy above
                     RetryPolicy = _retryPolicy
@@ -70,36 +72,29 @@ namespace DmlExec
                 CloudStorageAccount sourceAccount = GetAccount(copyItem.SourceAccountToken);
                 CloudStorageAccount destinationAccount = GetAccount(copyItem.DestinationAccountToken);
 
-                
-
                 // Represents a checkpoint from which a transfer may be resumed and continued.
                 // This is initalized as null first time then hydrated within CopyDirectoryAsync().
                 // However if this job is being resumed from a previous failure this function will hydrate
-                // Checkpoint from a serialized checkpoint saved to local storage.
+                // from a serialized checkpoint saved to blob storage.
                 TransferCheckpoint transferCheckpoint = GetTransferCheckpoint(copyItem.JobId);
 
+                
                 // Context object for the transfer, provides additional runtime information about its execution
-                TransferContext transferContext;
-
-                if (transferCheckpoint != null)
-                    // New Copy Job
-                    transferContext = new TransferContext(transferCheckpoint);
-                else
-                    // Resumed Copy Job
-                    transferContext = new TransferContext();
-
-                // Pipe transfer progress data to ProgressRecorder
-                // ProgressRecorder is used to log the results of the copy operation
-                transferContext.ProgressHandler = progressRecorder;
-
-                // If the destination already exists this Callback is called. 
-                // Return true or false to tell DML whether to overwrite the destination or not
-                // OverwriteFile() determines whether to overwrite the destination file
-                transferContext.OverwriteCallback = (source, destination) =>
+                // If this is a resumed copy operation then pass the checkpoint to the TransferContext so it can resume the copy
+                TransferContext transferContext = new TransferContext(transferCheckpoint)
                 {
-                    return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem, blobRequestOptions, opContext);
-                };
+                    // Pipe transfer progress data to ProgressRecorder
+                    // ProgressRecorder is used to log the results of the copy operation
+                    ProgressHandler = progressRecorder,
 
+                    // If the destination already exists this Callback is called. 
+                    // Return true or false to tell DML whether to overwrite the destination or not
+                    // OverwriteFile() determines whether to overwrite the destination file
+                    OverwriteCallback = (source, destination) =>
+                    {
+                        return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem.IsIncremental);
+                    }
+                };
 
                 // Set Options for copying the container such as search patterns, recursive, etc.
                 CopyDirectoryOptions copyDirectoryOptions = new CopyDirectoryOptions
@@ -109,8 +104,8 @@ namespace DmlExec
                 };
 
                 // Get the root source and destination directories for the two containers to be copied
-                CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer, blobRequestOptions);
-                CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer, blobRequestOptions);
+                CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer);
+                CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer);
 
 
                 // Copy the container
@@ -122,27 +117,31 @@ namespace DmlExec
             }
             catch (Exception ex)
             {
-                await log.WriteLineAsync("Backup Job error: " + copyItem.JobName + ", Error: " + ex.Message);
+                await log.WriteLineAsync("Backup Job error: " + copyItem.JobName);
+                await log.WriteLineAsync("Error: " + ex.Message);
                 await log.WriteLineAsync(progressRecorder.ToString());
+
+                // Rethrow the error to fail the web job.
+                throw ex;
             }
         }
-        private static bool OverwriteFile(string sourceUri, string destinationUri, CloudStorageAccount sourceAccount, CloudStorageAccount destinationAccount, CopyItem copyItem, BlobRequestOptions blobRequestOptions, OperationContext opContext)
+        private static bool OverwriteFile(string sourceUri, string destinationUri, CloudStorageAccount sourceAccount, CloudStorageAccount destinationAccount, bool isIncremental)
         {
             // If Incremental backup only copy if source is newer
-            if (copyItem.IsIncremental)
+            if (isIncremental)
             {
                 CloudBlob sourceBlob = new CloudBlob(new Uri(sourceUri), sourceAccount.Credentials);
                 CloudBlob destinationBlob = new CloudBlob(new Uri(destinationUri), destinationAccount.Credentials);
 
-                sourceBlob.FetchAttributes(null, blobRequestOptions, opContext);
-                destinationBlob.FetchAttributes(null, blobRequestOptions, opContext);
+                sourceBlob.FetchAttributes(null, _blobRequestOptions, _opContext);
+                destinationBlob.FetchAttributes(null, _blobRequestOptions, _opContext);
 
                 // Source date is newer (larger) than destination date
                 return (sourceBlob.Properties.LastModified > destinationBlob.Properties.LastModified);
             }
             else
             {
-                // Full backup, overwrite everything
+                // Full backup, overwrite file no matter what
                 return true;
             }
 
@@ -152,7 +151,7 @@ namespace DmlExec
             // Start the transfer
             try
             {
-                Task task = TransferManager.CopyDirectoryAsync(
+                await TransferManager.CopyDirectoryAsync(
                     sourceBlobDir: sourceDirectory,
                     destBlobDir: destinationDirectory,
                     isServiceCopy: false,
@@ -160,46 +159,51 @@ namespace DmlExec
                     context: transferContext,
                     cancellationToken: cancellationTokenSource.Token);
 
-                // Sleep for 1 seconds and cancel the transfer. 
-                // It may fail to cancel the transfer if transfer is done in 1 second. If so, no file will be copied after resume.
-                Thread.Sleep(1000);
-                Console.WriteLine("Cancel the transfer.");
-                cancellationTokenSource.Cancel();
-
-                await task;
-
                 // Store the transfer checkpoint to record the completed copy operation
                 transferCheckpoint = transferContext.LastCheckpoint;
             }
             catch (TransferException te)
             {
                 // Swallow Exceptions from skipped files in Overwrite Callback
-                // Log any other Transfer Exceptions
                 if (te.ErrorCode != TransferErrorCode.SubTransferFails)
                 {
+                    // Log any other Transfer Exceptions
                     StringBuilder sb = new StringBuilder();
                     sb.AppendLine("Transfer Error: " + te.Message);
                     sb.AppendLine("Transfer Error Code: " + te.ErrorCode);
                     await _log.WriteLineAsync(sb.ToString());
+                    
+                    // and rethrow it
+                    throw te;
                 }
             }
             catch (Exception ex)
             {
-                _log.WriteLine("Exception: " + ex.Message);
                 // Save the checkpoint so the WebJob can be restarted and resume the copy
                 transferCheckpoint = transferContext.LastCheckpoint;
                 SaveTransferCheckpoint(jobId, transferCheckpoint);
-                // Rethrow the exception
+                // Rethrow the exception so it is logged
                 throw ex;
             }
             
         }
-        private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName, BlobRequestOptions blobRequestOptions)
+        private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName)
         {
-            CloudBlobClient client = account.CreateCloudBlobClient();
-            client.DefaultRequestOptions = blobRequestOptions;
-            CloudBlobContainer container = client.GetContainerReference(containerName);
-            await container.CreateIfNotExistsAsync();
+            CloudBlobContainer container;
+
+            try
+            { 
+                CloudBlobClient client = account.CreateCloudBlobClient();
+                client.DefaultRequestOptions = _blobRequestOptions;
+                container = client.GetContainerReference(containerName);
+                await container.CreateIfNotExistsAsync();
+            }
+            catch (Exception ex)
+            {
+                // Add some additional informaiton for the error
+                string message = ex.Message;
+                throw new Exception("Error in GetDirectoryAsync(): " + message);
+            }
 
             // Return root directory for container
             return container.GetDirectoryReference("");
@@ -208,78 +212,114 @@ namespace DmlExec
         {
             CloudStorageAccount account;
 
-            if (!CloudStorageAccount.TryParse(GetConnectionString(accountToken), out account))
-                throw new StorageException("Error Parsing Storage Account Connection String");
-            else
-                return account;
+            try
+            {
+                if (!CloudStorageAccount.TryParse(GetConnectionString(accountToken), out account))
+                     _log.WriteLine("GetAccount test worked");
+            }
+            catch(Exception ex)
+            {
+                // Rethrow errors up so it can be logged in Web Jobs Dashboard.
+                throw ex;
+            }
+
+            return account;
         }
         private static string GetConnectionString(string accountToken)
         {
-            // Connection strings can be in app/web.config or in portal "connection strings" for host web app.
-            return ConfigurationManager.ConnectionStrings[accountToken].ConnectionString;
+            string connectionString = "";
+
+            try
+            { 
+                // Connection strings can be in app/web.config or in portal "connection strings" for host web app.
+                connectionString = ConfigurationManager.ConnectionStrings[accountToken].ConnectionString;
+            }
+            catch(Exception)
+            {
+                // When this fails it throws a null reference exception. 
+                // Swallow it and throw something more meaningful.
+                throw new Exception(string.Format("Copy Job Storage Account Token '{0}' not found. Please check this token in Connection Strings in Azure Portal", accountToken));
+            }
+
+            return connectionString;
         }
         private static TransferCheckpoint GetTransferCheckpoint(string jobId)
         {
             TransferCheckpoint transferCheckpoint = null;
-
+            
             try
-            { 
-                // Get the path to the checkpoint file
-                string path = GetLocalPath() + jobId.ToString();
+            {
+                // Get reference to storage account we are using for Web Jobs Storage
+                CloudBlobDirectory directory = GetCheckpointStorage();
+                CloudBlockBlob blob = directory.GetBlockBlobReference(jobId);
 
-                // If the file does not exist, then first time job has run, return a null checkpoint
-                if (File.Exists(path))
-                { 
-                    // File exists, so we are resuming a copy operation
-                    // Deserialize, hydrate Checkpoint and return
-                    // CopyDirectoryAsync() will resume where it left off
-                    using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.None))
+                if(blob.Exists(_blobRequestOptions, _opContext))
+                {
+                    using (var stream = new MemoryStream())
                     {
-                        IFormatter formatter = new BinaryFormatter();
+                        blob.DownloadToStream(stream, null, _blobRequestOptions, _opContext);
 
+                        stream.Position = 0;
+
+                        // Deserialize
+                        IFormatter formatter = new BinaryFormatter();
                         transferCheckpoint = formatter.Deserialize(stream) as TransferCheckpoint;
+
+                        _log.WriteLine("Resuming Copy. Job Id: " + jobId);
                     }
 
-                    File.Delete(path);
+                    // Clean up the serialized CheckPoint
+                    blob.Delete(DeleteSnapshotsOption.None, null, _blobRequestOptions, _opContext);
                 }
             }
             catch(Exception ex)
             {
-                _log.WriteLine("Error Fetching Checkpoint for Resume:" + ex.Message);
-                return null;
+                _log.WriteLine("Error Fetching Checkpoint for Copy Resume: " + ex.Message);
+                throw ex;
             }
             return transferCheckpoint;
         }
         private static void SaveTransferCheckpoint(string jobId, TransferCheckpoint transferCheckpoint)
         {
             try
-            { 
-                // Serialize the checkpoint into a file
-                string path = GetLocalPath() + jobId.ToString();
-            
-                using (var stream = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                // Get reference to storage account we are using for Web Jobs Storage
+                CloudBlobDirectory directory = GetCheckpointStorage();
+                CloudBlockBlob blob = directory.GetBlockBlobReference(jobId);
+
+                blob.DeleteIfExists(DeleteSnapshotsOption.None, null, _blobRequestOptions, _opContext);
+
+                using (var stream = new MemoryStream())
                 {
                     IFormatter formatter = new BinaryFormatter();
                     formatter.Serialize(stream, transferCheckpoint);
+
+                    // Set the stream back at the front
+                    stream.Position = 0;
+                    
+                    blob.UploadFromStream(stream, null, _blobRequestOptions, _opContext);
                 }
             }
             catch(Exception ex)
             {
                 _log.WriteLine("Error saving checkpoint:" + ex.Message);
+                throw ex;
             }
         }
-        private static string GetLocalPath()
+        private static CloudBlobDirectory GetCheckpointStorage()
         {
-            string localPath = "";
+            // Use WebJobs Storage Account to store the DML CheckPoints
+            string connectionString = ConfigurationManager.AppSettings["AzureWebJobsStorage"].ToString();
 
-            // Map the path, add trailing slash
-            localPath = Path.Combine(System.Web.HttpRuntime.AppDomainAppPath, "DmlTransfers\\");
+            CloudBlobClient client = CloudStorageAccount.Parse(connectionString).CreateCloudBlobClient();
+            client.DefaultRequestOptions = _blobRequestOptions;
 
-            // Create the directory if doesn't exist
-            if (!Directory.Exists(localPath))
-                Directory.CreateDirectory(localPath);
-
-            return localPath;
+            // Fetch Container for storing the CheckPoints
+            CloudBlobContainer container = client.GetContainerReference("dmlcheckpoints");
+            container.CreateIfNotExists();
+    
+            // Return root directory for container
+            return container.GetDirectoryReference("");
         }
         static void StorageRequest_Retrying(object sender, RequestEventArgs e)
         {
@@ -289,7 +329,7 @@ namespace DmlExec
             OperationContext oc = (OperationContext)sender;
             int retryCount = oc.RequestResults.Count;
 
-            string message = String.Format(CultureInfo.InvariantCulture, "Retry Count = {0}, Error = {1}, URI = {2}", retryCount, errMessage, path);
+            string message = string.Format(CultureInfo.InvariantCulture, "Retry Count = {0}, Error = {1}, URI = {2}", retryCount, errMessage, path);
 
             _log.WriteLine("Azure Storage Request Retry", message);
         }
