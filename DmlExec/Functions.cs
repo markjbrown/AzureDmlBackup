@@ -214,12 +214,11 @@ namespace DmlExec
 
             try
             {
-                if (!CloudStorageAccount.TryParse(GetConnectionString(accountToken), out account))
-                     _log.WriteLine("GetAccount test worked");
+                account = CloudStorageAccount.Parse(GetConnectionString(accountToken));
             }
             catch(Exception ex)
             {
-                // Rethrow errors up so it can be logged in Web Jobs Dashboard.
+                // Rethrow so it can be logged in Web Jobs Dashboard.
                 throw ex;
             }
 
