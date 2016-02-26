@@ -14,6 +14,7 @@ using System.Runtime.Serialization.Formatters.Binary;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using System.Collections.Generic;
 
 namespace DmlExec
 {
@@ -27,16 +28,20 @@ namespace DmlExec
 
         private static BlobRequestOptions _blobRequestOptions;
         private static OperationContext _opContext;
-        private static TextWriter _log;
 
-        public async static Task ProcessQueueMessage([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
+        private static List<TransferDetail> _failedFiles = new List<TransferDetail>();
+        private static List<TransferDetail> _skippedFiles = new List<TransferDetail>();
+
+
+        public async static Task ProcessMessage([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
         {
-            _log = log;
+            // Copy TextWrite into Log Helper class
+            Logger.log = log;
 
-            await log.WriteLineAsync("Job Start: " + copyItem.JobName);
-            await log.WriteLineAsync("");
+            // Log Job Start
+            await Logger.JobStartAsync(copyItem.JobName);
 
-            // This class accumulates transfer data during the process
+            // This class accumulates transfer data during the copy
             ProgressRecorder progressRecorder = new ProgressRecorder();
 
             try
@@ -81,7 +86,7 @@ namespace DmlExec
                 // This is initalized as null first time then hydrated within CopyDirectoryAsync().
                 // However if this job is being resumed from a previous failure this function will hydrate
                 // from a serialized checkpoint saved to blob storage.
-                TransferCheckpoint transferCheckpoint = GetTransferCheckpoint(copyItem.JobId);
+                TransferCheckpoint transferCheckpoint = await GetTransferCheckpoint(copyItem.JobId);
 
                 
                 // Context object for the transfer, provides additional runtime information about its execution
@@ -100,9 +105,10 @@ namespace DmlExec
                     }
                 };
 
-                // This delegate can be used to log each skipped file during a transfer
+                // This event is used to log files skipped during the transfer
                 transferContext.FileSkipped += TransferContext_FileSkipped;
-                // This delegate can be used to log each file that fails during a transfer
+                
+                // This event is used to catch exceptions for files that fail during a transfer
                 transferContext.FileFailed += TransferContext_FileFailed;
 
                 // Set Options for copying the container such as search patterns, recursive, etc.
@@ -118,19 +124,28 @@ namespace DmlExec
 
 
                 // Copy the container
-                await CopyDirectoryAsync(copyItem.JobId, sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
+                await CopyDirectoryAsync(sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
 
-                await log.WriteLineAsync("Job Complete: " + copyItem.JobName);
-                await log.WriteLineAsync(progressRecorder.ToString());
+
+                // Check if any files failed during transfer
+                if (_failedFiles.Count > 0)
+                {
+                    // Save a Checkpoint so we can restart the transfer
+                    transferCheckpoint = transferContext.LastCheckpoint;
+                    SaveTransferCheckpoint(copyItem.JobId, transferCheckpoint);
+                    // Throw an exception to fail the job so WebJobs will rerun it
+                    throw new Exception("One or more errors occurred during the transfer.");
+                }
+
+                // Log job completion
+                await Logger.JobCompleteAsync(copyItem.JobName, progressRecorder, _skippedFiles);
+
             }
             catch (Exception ex)
             {
-                await log.WriteLineAsync("Error for Job: " + copyItem.JobName);
-                await log.WriteLineAsync("Error: " + ex.Message);
-                await log.WriteLineAsync("WebJobs will make 5 attempts to rerun and complete");
-                await log.WriteLineAsync(progressRecorder.ToString());
-
-                // Rethrow the error to fail the web job.
+                // Log Job Error
+                await Logger.JobErrorAsync(copyItem.JobName, ex.Message, progressRecorder, _failedFiles, _skippedFiles);
+                // Rethrow the error to fail the web job
                 throw ex;
             }
         }
@@ -154,9 +169,8 @@ namespace DmlExec
                 // Full backup, overwrite file no matter what
                 return true;
             }
-
         }
-        private async static Task CopyDirectoryAsync(string jobId, CloudBlobDirectory sourceDirectory, CloudBlobDirectory destinationDirectory, CopyDirectoryOptions copyDirectoryOptions, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
+        private async static Task CopyDirectoryAsync(CloudBlobDirectory sourceDirectory, CloudBlobDirectory destinationDirectory, CopyDirectoryOptions copyDirectoryOptions, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
         {
             // Start the transfer
             try
@@ -172,13 +186,13 @@ namespace DmlExec
                 // Store the transfer checkpoint to record the completed copy operation
                 transferCheckpoint = transferContext.LastCheckpoint;
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                // Save the checkpoint so the WebJob can be restarted to resume the copy
-                transferCheckpoint = transferContext.LastCheckpoint;
-                SaveTransferCheckpoint(jobId, transferCheckpoint);
-                // Rethrow the exception up the call stack so it can be logged and to fail the WebJob
-                throw ex;
+                // Swallow all exceptions here. Files skipped in the OverwriteCallback throw an exception here
+                // even in an Incremental copy where the source is skipped because it and destination are identical
+                // Instead all exceptions from transfers are handled in the FileFailed event handler.
+                // Fatal exceptions resulting in the transfer being cancelled will still show in the FileFailed event
+                // handler so will still be captured allow us to save the checkpoint and retry the copy operation.
             }
         }
         private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName)
@@ -194,9 +208,7 @@ namespace DmlExec
             }
             catch (Exception ex)
             {
-                // Add some additional informaiton for the error
-                string message = ex.Message;
-                throw new Exception("Error in GetDirectoryAsync(): " + message);
+                throw new Exception("Error in GetDirectoryAsync(): " + ex.Message);
             }
 
             // Return root directory for container
@@ -212,8 +224,7 @@ namespace DmlExec
             }
             catch(Exception ex)
             {
-                // Rethrow so it can be logged in Web Jobs Dashboard.
-                throw ex;
+                throw new Exception("Error in GetAccount(): " + ex.Message);
             }
 
             return account;
@@ -231,26 +242,26 @@ namespace DmlExec
             {
                 // When this fails it throws a null reference exception. 
                 // Swallow it and throw something more meaningful.
-                throw new Exception(string.Format("Copy Job Storage Account Token '{0}' not found. Please check this token in Connection Strings in Azure Portal", accountToken));
+                throw new Exception(string.Format("Error in GetAccount(): Copy Job Storage Account Token '{0}' not found. Please check this token in Connection Strings in Azure Portal", accountToken));
             }
 
             return connectionString;
         }
-        private static TransferCheckpoint GetTransferCheckpoint(string jobId)
+        private async static Task<TransferCheckpoint> GetTransferCheckpoint(string jobId)
         {
             TransferCheckpoint transferCheckpoint = null;
             
             try
             {
                 // Get reference to storage account we are using for Web Jobs Storage
-                CloudBlobDirectory directory = GetCheckpointStorage();
+                CloudBlobDirectory directory = await GetCheckpointStorage();
                 CloudBlockBlob blob = directory.GetBlockBlobReference(jobId);
 
-                if(blob.Exists(_blobRequestOptions, _opContext))
+                if(await blob.ExistsAsync(_blobRequestOptions, _opContext))
                 {
                     using (var stream = new MemoryStream())
                     {
-                        blob.DownloadToStream(stream, null, _blobRequestOptions, _opContext);
+                        await blob.DownloadToStreamAsync(stream, null, _blobRequestOptions, _opContext);
 
                         stream.Position = 0;
 
@@ -258,29 +269,29 @@ namespace DmlExec
                         IFormatter formatter = new BinaryFormatter();
                         transferCheckpoint = formatter.Deserialize(stream) as TransferCheckpoint;
 
-                        _log.WriteLine("Resuming Copy. Job Id: " + jobId);
+                        //_log.WriteLine("Resuming Copy. Job Id: " + jobId);
+                        await Logger.JobInfoAsync("Resuming Copy. Job Id: " + jobId);
                     }
 
                     // Clean up the serialized CheckPoint
-                    blob.Delete(DeleteSnapshotsOption.None, null, _blobRequestOptions, _opContext);
+                    await blob.DeleteAsync(DeleteSnapshotsOption.None, null, _blobRequestOptions, _opContext);
                 }
             }
             catch(Exception ex)
             {
-                _log.WriteLine("Error Fetching Checkpoint for Copy Resume: " + ex.Message);
-                throw ex;
+                throw new Exception("Error in GetTransferCheckpoint(): " + ex.Message);
             }
             return transferCheckpoint;
         }
-        private static void SaveTransferCheckpoint(string jobId, TransferCheckpoint transferCheckpoint)
+        private async static void SaveTransferCheckpoint(string jobId, TransferCheckpoint transferCheckpoint)
         {
             try
             {
                 // Get reference to storage account we are using for Web Jobs Storage
-                CloudBlobDirectory directory = GetCheckpointStorage();
+                CloudBlobDirectory directory = await GetCheckpointStorage();
                 CloudBlockBlob blob = directory.GetBlockBlobReference(jobId);
 
-                blob.DeleteIfExists(DeleteSnapshotsOption.None, null, _blobRequestOptions, _opContext);
+                await blob.DeleteIfExistsAsync(DeleteSnapshotsOption.None, null, _blobRequestOptions, _opContext);
 
                 using (var stream = new MemoryStream())
                 {
@@ -289,16 +300,15 @@ namespace DmlExec
 
                     stream.Position = 0;
                                         
-                    blob.UploadFromStream(stream, null, _blobRequestOptions, _opContext);
+                    await blob.UploadFromStreamAsync(stream, null, _blobRequestOptions, _opContext);
                 }
             }
             catch(Exception ex)
             {
-                _log.WriteLine("Error saving checkpoint:" + ex.Message);
-                throw ex;
+                throw new Exception("Error in SaveTransferCheckpoint(): " + ex.Message);
             }
         }
-        private static CloudBlobDirectory GetCheckpointStorage()
+        private async static Task<CloudBlobDirectory> GetCheckpointStorage()
         {
             // Use WebJobs Storage Account to store the DML CheckPoints
             string connectionString = ConfigurationManager.AppSettings["AzureWebJobsStorage"].ToString();
@@ -308,7 +318,7 @@ namespace DmlExec
 
             // Fetch Container for storing the CheckPoints
             CloudBlobContainer container = client.GetContainerReference("dmlcheckpoints");
-            container.CreateIfNotExists();
+            await container.CreateIfNotExistsAsync();
     
             // Return root directory for container
             return container.GetDirectoryReference("");
@@ -323,15 +333,34 @@ namespace DmlExec
 
             string message = string.Format(CultureInfo.InvariantCulture, "Retry Count = {0}, Error = {1}, URI = {2}", retryCount, errMessage, path);
 
-            _log.WriteLine("Azure Storage Request Retry", message);
+            Logger.JobInfo("Azure Storage Request Retry: " + message);
         }
         private static void TransferContext_FileFailed(object sender, TransferEventArgs e)
         {
-            //_log.WriteLine("Transfer from {0} to {1} failed: {2}", e.Source, e.Destination, e.Exception.Message);
+            // We need to trap transfer failures in this event handler rather than CopyDirectoryAsync()           
+
+            // Add the transfer error information from the FileFailed event into the List object
+            // This will be written to the WebJobs log
+            _failedFiles.Add(new TransferDetail
+            {
+                Source = e.Source,
+                Destination = e.Destination,
+                Error = e.Exception.Message
+            });
         }
         private static void TransferContext_FileSkipped(object sender, TransferEventArgs e)
         {
-            //_log.WriteLine("Transfer skipped for file {0}. Message: {1}", e.Source, e.Exception.Message);
+            // This is largely optional. Files can be skipped if the source and destination are the same for Incremental Copies
+            // So this information does not always represent an error that occurred but is driven by the OverwriteCallback
+
+            // Add the transfer error information from the FileSkipped event into the List object
+            // This will be written to the WebJobs log
+            _skippedFiles.Add(new TransferDetail
+            {
+                Source = e.Source,
+                Destination = e.Destination,
+                Error = e.Exception.Message
+            });
         }
     }
 }
