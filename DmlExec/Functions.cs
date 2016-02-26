@@ -32,7 +32,9 @@ namespace DmlExec
         public async static Task ProcessQueueMessage([QueueTrigger("backupqueue")] CopyItem copyItem, TextWriter log, CancellationToken cancelToken)
         {
             _log = log;
+
             await log.WriteLineAsync("Job Start: " + copyItem.JobName);
+            await log.WriteLineAsync("");
 
             // This class accumulates transfer data during the process
             ProgressRecorder progressRecorder = new ProgressRecorder();
@@ -65,6 +67,9 @@ namespace DmlExec
                 // uploading large amounts of data where we'd send 100's so set to false
                 ServicePointManager.Expect100Continue = false;
 
+                // User Agent for tracing
+                TransferManager.Configurations.UserAgentPrefix = "AzureDmlBackup";
+
                 // CancellationTokenSource used to cancel the transfer
                 CancellationTokenSource cancellationTokenSource = new CancellationTokenSource();
 
@@ -87,14 +92,18 @@ namespace DmlExec
                     // ProgressRecorder is used to log the results of the copy operation
                     ProgressHandler = progressRecorder,
 
-                    // If the destination already exists this Callback is called. 
-                    // Return true or false to tell DML whether to overwrite the destination or not
-                    // OverwriteFile() determines whether to overwrite the destination file
+                    // If the destination already exists this delegate is called. 
+                    // Return true to overwrite or false to skip the file during the transfer
                     OverwriteCallback = (source, destination) =>
                     {
                         return OverwriteFile(source, destination, sourceAccount, destinationAccount, copyItem.IsIncremental);
                     }
                 };
+
+                // This delegate can be used to log each skipped file during a transfer
+                transferContext.FileSkipped += TransferContext_FileSkipped;
+                // This delegate can be used to log each file that fails during a transfer
+                transferContext.FileFailed += TransferContext_FileFailed;
 
                 // Set Options for copying the container such as search patterns, recursive, etc.
                 CopyDirectoryOptions copyDirectoryOptions = new CopyDirectoryOptions
@@ -111,20 +120,21 @@ namespace DmlExec
                 // Copy the container
                 await CopyDirectoryAsync(copyItem.JobId, sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
 
-
-                await log.WriteLineAsync(progressRecorder.ToString());
                 await log.WriteLineAsync("Job Complete: " + copyItem.JobName);
+                await log.WriteLineAsync(progressRecorder.ToString());
             }
             catch (Exception ex)
             {
-                await log.WriteLineAsync("Backup Job error: " + copyItem.JobName);
+                await log.WriteLineAsync("Error for Job: " + copyItem.JobName);
                 await log.WriteLineAsync("Error: " + ex.Message);
+                await log.WriteLineAsync("WebJobs will make 5 attempts to rerun and complete");
                 await log.WriteLineAsync(progressRecorder.ToString());
 
                 // Rethrow the error to fail the web job.
                 throw ex;
             }
         }
+
         private static bool OverwriteFile(string sourceUri, string destinationUri, CloudStorageAccount sourceAccount, CloudStorageAccount destinationAccount, bool isIncremental)
         {
             // If Incremental backup only copy if source is newer
@@ -162,30 +172,14 @@ namespace DmlExec
                 // Store the transfer checkpoint to record the completed copy operation
                 transferCheckpoint = transferContext.LastCheckpoint;
             }
-            catch (TransferException te)
-            {
-                // Swallow Exceptions from skipped files in Overwrite Callback
-                if (te.ErrorCode != TransferErrorCode.SubTransferFails)
-                {
-                    // Log any other Transfer Exceptions
-                    StringBuilder sb = new StringBuilder();
-                    sb.AppendLine("Transfer Error: " + te.Message);
-                    sb.AppendLine("Transfer Error Code: " + te.ErrorCode);
-                    await _log.WriteLineAsync(sb.ToString());
-                    
-                    // and rethrow it
-                    throw te;
-                }
-            }
             catch (Exception ex)
             {
-                // Save the checkpoint so the WebJob can be restarted and resume the copy
+                // Save the checkpoint so the WebJob can be restarted to resume the copy
                 transferCheckpoint = transferContext.LastCheckpoint;
                 SaveTransferCheckpoint(jobId, transferCheckpoint);
-                // Rethrow the exception so it is logged
+                // Rethrow the exception up the call stack so it can be logged and to fail the WebJob
                 throw ex;
             }
-            
         }
         private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName)
         {
@@ -293,9 +287,8 @@ namespace DmlExec
                     IFormatter formatter = new BinaryFormatter();
                     formatter.Serialize(stream, transferCheckpoint);
 
-                    // Set the stream back at the front
                     stream.Position = 0;
-                    
+                                        
                     blob.UploadFromStream(stream, null, _blobRequestOptions, _opContext);
                 }
             }
@@ -331,6 +324,14 @@ namespace DmlExec
             string message = string.Format(CultureInfo.InvariantCulture, "Retry Count = {0}, Error = {1}, URI = {2}", retryCount, errMessage, path);
 
             _log.WriteLine("Azure Storage Request Retry", message);
+        }
+        private static void TransferContext_FileFailed(object sender, TransferEventArgs e)
+        {
+            //_log.WriteLine("Transfer from {0} to {1} failed: {2}", e.Source, e.Destination, e.Exception.Message);
+        }
+        private static void TransferContext_FileSkipped(object sender, TransferEventArgs e)
+        {
+            //_log.WriteLine("Transfer skipped for file {0}. Message: {1}", e.Source, e.Exception.Message);
         }
     }
 }

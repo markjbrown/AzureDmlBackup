@@ -2,6 +2,7 @@
 using System.IO;
 using Microsoft.Azure.WebJobs;
 using Shared;
+using System.Text;
 
 namespace Incremental
 {
@@ -28,25 +29,31 @@ namespace Incremental
                 bool isIncremental = true;
 
                 // Pop messages on the queue to copy one or more containers between two storage accounts
-                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
-                message.Add(CreateJob(sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
+                message.Add(CreateJob("Incremental images backup", sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
+                message.Add(CreateJob("Incremental docs backup", sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
+                
             }
             catch (Exception ex)
             {
                 log.WriteLine(ex.Message);
             }
         }
-        private static CopyItem CreateJob(string sourceAccountToken, string destinationAccountToken, string sourceContainer, string destinationContainer, bool isIncremental, TextWriter log)
+        private static CopyItem CreateJob(string jobName, string sourceAccountToken, string destinationAccountToken, string sourceContainer, string destinationContainer, bool isIncremental, TextWriter log)
         {
-            string jobName = "Incremental Backup, Account: " + sourceAccountToken + ", Source Container: " + sourceContainer + ", Destination Container: " + destinationContainer;
-
             string jobId = Guid.NewGuid().ToString();
 
             // Create CopyItem object, pass it to WebJobs queue
             CopyItem copyitem = new CopyItem(jobId, jobName, sourceAccountToken, destinationAccountToken, sourceContainer, destinationContainer, isIncremental);
 
             // Log Job Creation
-            log.WriteLine("Create Job: " + jobName);
+            StringBuilder message = new StringBuilder();
+            message.AppendLine("Queued Job: " + jobName);
+            message.AppendLine("Source Account: " + sourceAccountToken);
+            message.AppendLine("Source Container: " + sourceContainer);
+            message.AppendLine("Destination Container: " + destinationContainer);
+            message.AppendLine("");
+
+            log.WriteLine(message);
 
             return copyitem;
         }
