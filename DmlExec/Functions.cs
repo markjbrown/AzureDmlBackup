@@ -124,7 +124,7 @@ namespace DmlExec
 
 
                 // Copy the container
-                await CopyDirectoryAsync(sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
+                await CopyDirectoryAsync(copyItem.JobId, sourceDirectory, destinationDirectory, copyDirectoryOptions, transferContext, transferCheckpoint, cancellationTokenSource);
 
 
                 // Check if any files failed during transfer
@@ -170,7 +170,7 @@ namespace DmlExec
                 return true;
             }
         }
-        private async static Task CopyDirectoryAsync(CloudBlobDirectory sourceDirectory, CloudBlobDirectory destinationDirectory, CopyDirectoryOptions copyDirectoryOptions, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
+        private async static Task CopyDirectoryAsync(string jobId, CloudBlobDirectory sourceDirectory, CloudBlobDirectory destinationDirectory, CopyDirectoryOptions copyDirectoryOptions, TransferContext transferContext, TransferCheckpoint transferCheckpoint, CancellationTokenSource cancellationTokenSource)
         {
             // Start the transfer
             try
@@ -191,11 +191,15 @@ namespace DmlExec
                 // Swallow all transfer exceptions here. Files skipped in the OverwriteCallback throw an exception here
                 // even in an Incremental copy where the source is skipped because it and destination are identical
                 // Instead all exceptions from transfers are handled in the FileFailed event handler.
-                // Fatal exceptions resulting in the transfer being cancelled will still show in the FileFailed event
-                // handler so will still be captured allow us to save the checkpoint and retry the copy operation.
             }
             catch (Exception ex)
             {
+                // Fatal or other exceptions resulting in the transfer being cancelled will still appear here
+                
+                // Save a Checkpoint so we can restart the transfer
+                transferCheckpoint = transferContext.LastCheckpoint;
+                SaveTransferCheckpoint(jobId, transferCheckpoint);
+
                 throw new Exception("Error in CopyDirectoryAsync(): " + ex.Message);
             }
         }
