@@ -186,13 +186,17 @@ namespace DmlExec
                 // Store the transfer checkpoint to record the completed copy operation
                 transferCheckpoint = transferContext.LastCheckpoint;
             }
-            catch (Exception)
+            catch(TransferException)
             {
-                // Swallow all exceptions here. Files skipped in the OverwriteCallback throw an exception here
+                // Swallow all transfer exceptions here. Files skipped in the OverwriteCallback throw an exception here
                 // even in an Incremental copy where the source is skipped because it and destination are identical
                 // Instead all exceptions from transfers are handled in the FileFailed event handler.
                 // Fatal exceptions resulting in the transfer being cancelled will still show in the FileFailed event
                 // handler so will still be captured allow us to save the checkpoint and retry the copy operation.
+            }
+            catch (Exception ex)
+            {
+                throw new Exception("Error in CopyDirectoryAsync(): " + ex.Message);
             }
         }
         private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName)
