@@ -29,16 +29,16 @@ namespace Full
             bool isIncremental = false;
 
             // Pop messages on the queue to copy one or more containers between two storage accounts
-            message.Add(CreateJob("Full images backup", sourceAccountToken, destinationAccountToken, "images", "imagesbackup", isIncremental, log));
-            message.Add(CreateJob("Full docs backup", sourceAccountToken, destinationAccountToken, "docs", "docsbackup", isIncremental, log));
+            message.Add(CreateJob("Full images backup", sourceAccountToken, destinationAccountToken, "images", "", "imagesbackup", "", isIncremental, log));
+            message.Add(CreateJob("Full docs backup", sourceAccountToken, destinationAccountToken, "docs", "", "docsbackup", "", isIncremental, log));
         }
 
-        private static CopyItem CreateJob(string jobName, string sourceAccountToken, string destinationAccountToken, string sourceContainer, string destinationContainer, bool isIncremental, TextWriter log)
+        private static CopyItem CreateJob(string jobName, string sourceAccountToken, string destinationAccountToken, string sourceContainer, string sourceDirectory, string destinationContainer, string destinationDirectory, bool isIncremental, TextWriter log)
         {
             string jobId = Guid.NewGuid().ToString();
 
             // Create CopyItem object, pass it to WebJobs queue
-            CopyItem copyitem = new CopyItem(jobId, jobName, sourceAccountToken, destinationAccountToken, sourceContainer, destinationContainer, isIncremental);
+            CopyItem copyitem = new CopyItem(jobId, jobName, sourceAccountToken, destinationAccountToken, sourceContainer, sourceDirectory, destinationContainer, destinationDirectory, isIncremental);
 
             // Log Job Creation
             StringBuilder message = new StringBuilder();

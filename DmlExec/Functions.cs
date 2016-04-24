@@ -119,8 +119,8 @@ namespace DmlExec
                 };
 
                 // Get the root source and destination directories for the two containers to be copied
-                CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer);
-                CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer);
+                CloudBlobDirectory sourceDirectory = await GetDirectoryAsync(sourceAccount, copyItem.SourceContainer, copyItem.SourceDirectory);
+                CloudBlobDirectory destinationDirectory = await GetDirectoryAsync(destinationAccount, copyItem.DestinationContainer, copyItem.DestinationDirectory);
 
 
                 // Copy the container
@@ -203,7 +203,7 @@ namespace DmlExec
                 throw new Exception("Error in CopyDirectoryAsync(): " + ex.Message);
             }
         }
-        private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName)
+        private async static Task<CloudBlobDirectory> GetDirectoryAsync(CloudStorageAccount account, string containerName, string directoryName)
         {
             CloudBlobContainer container;
 
@@ -219,8 +219,8 @@ namespace DmlExec
                 throw new Exception("Error in GetDirectoryAsync(): " + ex.Message);
             }
 
-            // Return root directory for container
-            return container.GetDirectoryReference("");
+            // Return the directory for container
+            return container.GetDirectoryReference(directoryName);
         }
         private static CloudStorageAccount GetAccount(string accountToken)
         {
