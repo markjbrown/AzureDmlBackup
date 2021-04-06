@@ -1,4 +1,6 @@
-# AzureDmlBackup
+# AzureDmlBackup (Archived)
+
+This repo is now archived.
 
 This solution is the source for a sample solution that shows  how to use Azure WebJobs and the Azure Storage Data Movement Library
 to create an automated copy or backup service for Azure Storage Blobs. 
